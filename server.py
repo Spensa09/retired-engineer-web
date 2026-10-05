@@ -49,6 +49,8 @@ def initialize():
         CREATE TABLE IF NOT EXISTS login_attempts (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS message_reads (user_id INTEGER NOT NULL REFERENCES users(id), request_id INTEGER NOT NULL REFERENCES requests(id), last_id INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(user_id,request_id));
         CREATE TABLE IF NOT EXISTS administrators (user_id INTEGER PRIMARY KEY REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS visitors (token TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS page_stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
         ''')
     keyfile=DATA/'admin-setup-key.txt'
     if not keyfile.exists():
@@ -117,29 +119,64 @@ class Handler(BaseHTTPRequestHandler):
         if path not in files: return self.respond({'error':'页面不存在。'},404)
         filename = ROOT / files[path]
         body = filename.read_bytes()
+        # 仅在加载应用首页时统计访客与页面浏览量，避免 JS/CSS/图标刷新干扰数据。
+        visitor_cookie=None
+        if path=='/':
+            visitor_cookie=self.record_visit()
         self.send_response(200)
         mime = {'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'}
         self.send_header('Content-Type',mime[filename.suffix]+'; charset=utf-8')
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        if visitor_cookie:
+            self.send_header('Set-Cookie',visitor_cookie)
         self.send_header('Content-Length',str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def record_visit(self):
+        """记录一次首页访问。若访客是首次访问（无 visitor cookie），返回需下发的 cookie 字符串。"""
+        try:
+            cookie = SimpleCookie(); cookie.load(self.headers.get('Cookie',''))
+            token = cookie['visitor'].value if 'visitor' in cookie else ''
+            now = int(time.time())
+            with connect() as db:
+                db.execute("INSERT INTO page_stats(key,value) VALUES('page_views',1) ON CONFLICT(key) DO UPDATE SET value=value+1")
+                if token:
+                    db.execute('UPDATE visitors SET last_seen=? WHERE token=?',(now,token))
+                    db.commit()
+                    return None
+                token = secrets.token_urlsafe(16)
+                db.execute('INSERT OR IGNORE INTO visitors(token,first_seen,last_seen) VALUES(?,?,?)',(token,now,now))
+                db.commit()
+            return f'visitor={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000'
+        except Exception:
+            return None
 
     def do_POST(self):
         self.api('POST',urlparse(self.path).path)
 
     def api(self, method, path):
         try:
-            # Reject cross-origin writes, including requests from untrusted local web pages.
-            host = self.headers.get('Host','')
-            if host not in (f'127.0.0.1:{self.server.server_port}',f'localhost:{self.server.server_port}'):
-                raise APIError('访问地址不受支持。',403)
+            # 本地回环绑定（127.0.0.1 / localhost）时，严格校验 Host，防止 DNS 重绑定/跨站请求本机服务。
+            # 部署到公网（0.0.0.0 或具体 IP）时，服务器本就对外可见，只需依赖 Cookie 的 SameSite=Strict
+            # 与 POST 的 Origin 校验，因此不再限制 Host。
+            bind = self.server.server_address[0]
+            loopback = bind in ('127.0.0.1','localhost','::1')
+            if loopback:
+                host = self.headers.get('Host','')
+                port = self.server.server_port
+                if host not in (f'127.0.0.1:{port}',f'localhost:{port}',
+                                f'[::1]:{port}','127.0.0.1','localhost','[::1]'):
+                    raise APIError('访问地址不受支持。',403)
             if method == 'POST':
                 origin = self.headers.get('Origin')
-                if origin and origin not in (f'http://127.0.0.1:{self.server.server_port}',f'http://localhost:{self.server.server_port}'):
-                    raise APIError('请求来源不受支持。',403)
+                if origin:
+                    # 要求 Origin 的主机名与当前请求的 Host 一致（同源请求）。
+                    o_host = urlparse(origin).netloc
+                    if o_host and o_host != self.headers.get('Host',''):
+                        raise APIError('请求来源不受支持。',403)
                 if self.headers.get('Sec-Fetch-Site') == 'cross-site': raise APIError('请求来源不受支持。',403)
                 if not self.headers.get('Content-Type','').startswith('application/json'): raise APIError('请使用网页提交。',415)
             with connect() as db:
@@ -161,6 +198,12 @@ class Handler(BaseHTTPRequestHandler):
                             (SELECT COUNT(*) FROM messages m WHERE m.request_id=r.id) message_count
                             FROM requests r JOIN users s ON s.id=r.student_id JOIN users e ON e.id=r.engineer_id ORDER BY r.created DESC,r.id DESC''').fetchall()
                             return self.respond({'users':[{**public_user(x),'email':x['email'],'created':x['created']} for x in users],'requests':[dict(x) for x in rows],'message_count':db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]})
+                        if path == '/api/admin/visitor-stats':
+                            unique_visitors=db.execute('SELECT COUNT(*) FROM visitors').fetchone()[0]
+                            row=db.execute("SELECT value FROM page_stats WHERE key='page_views'").fetchone()
+                            page_views=row[0] if row else 0
+                            active_today=db.execute('SELECT COUNT(*) FROM visitors WHERE last_seen>?',(int(time.time())-86400,)).fetchone()[0]
+                            return self.respond({'unique_visitors':unique_visitors,'page_views':page_views,'active_today':active_today})
                         if path == '/api/admin/conversation':
                             rid=int(parse_qs(urlparse(self.path).query).get('request_id',['0'])[0])
                             r=db.execute('SELECT r.*,s.name student_name,e.name engineer_name FROM requests r JOIN users s ON s.id=r.student_id JOIN users e ON e.id=r.engineer_id WHERE r.id=?',(rid,)).fetchone()
@@ -316,10 +359,14 @@ class Handler(BaseHTTPRequestHandler):
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('--port',type=int,default=8765)
+    parser.add_argument('--host',default='127.0.0.1',
+        help='绑定地址。本地调试用 127.0.0.1（默认，仅本机可访问）；'
+             '部署到服务器请用 0.0.0.0 或服务器网卡 IP。')
     args=parser.parse_args()
     initialize()
-    server=ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
-    print(f'TorchLab ready: http://127.0.0.1:{args.port}',flush=True)
+    server=ThreadingHTTPServer((args.host,args.port),Handler)
+    bind_addr=args.host if args.host!='0.0.0.0' else '127.0.0.1'
+    print(f'TorchLab ready: http://{bind_addr}:{args.port}  (listening on {args.host}:{args.port})',flush=True)
     try: server.serve_forever()
     except KeyboardInterrupt: pass
     finally: server.server_close()

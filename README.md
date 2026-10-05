@@ -1,4 +1,4 @@
-# 薪火工坊 / TorchLab
+# 工程火种 / TorchLab
 
 本地网页应用，使用 Python 3.10+ 标准库及 SQLite，无需安装额外依赖。
 
@@ -7,6 +7,16 @@
 双击 `start.bat`，保持窗口开启，然后在浏览器打开 http://127.0.0.1:8765 。
 
 也可运行 `python server.py`。端口占用时运行 `python server.py --port 8766`，并使用相应地址。
+
+## 部署到服务器
+
+默认只绑定本机回环地址（`127.0.0.1`），仅本机可访问。部署到公网时使用 `--host` 参数：
+
+```
+python server.py --host 0.0.0.0 --port 8765
+```
+
+绑定到 `0.0.0.0`（或服务器网卡 IP）后，外网才能访问；此时不再限制请求的 Host 头，改为依赖同源 Origin 校验与 Cookie 的 `SameSite` 来防止跨站请求。建议在前面加一层 HTTPS 反向代理（如 Nginx/Caddy），并通过防火墙只开放需要的端口。
 
 ## 使用
 
