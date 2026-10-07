@@ -298,8 +298,8 @@ class Handler(BaseHTTPRequestHandler):
                     if specialty not in ('机械工程','电子工程','土木工程','环境工程','计算机工程','航空航天'): raise APIError('请选择有效专业。')
                     years=int(data.get('years',0))
                     if not 0<=years<=70: raise APIError('从业年限需在 0–70 年之间。')
-                    fee=self.field(data,'fee',40)
-                    if fee not in ('公益指导','低收费 · 面议'): raise APIError('请选择指导方式。')
+                    # 平台所有指导均为公益性质，忽略客户端可能提交的 fee 字段。
+                    fee='公益指导'
                     available=1 if data.get('available') is True else 0
                     db.execute('UPDATE users SET name=?,bio=?,specialty=?,years=?,fee=?,available=? WHERE id=?',(name,bio,specialty,years,fee,available,u['id']))
                     db.commit()
