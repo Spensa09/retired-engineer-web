@@ -128,7 +128,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type',mime[filename.suffix]+'; charset=utf-8')
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Referrer-Policy','same-origin')
-        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://trae-api-cn.mchost.guru https://lf-cdn.trae.com.cn; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if visitor_cookie:
             self.send_header('Set-Cookie',visitor_cookie)
         self.send_header('Content-Length',str(len(body)))
