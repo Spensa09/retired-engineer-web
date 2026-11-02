@@ -16,6 +16,12 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / 'data'
 DB = DATA / 'torchlab.sqlite3'
 
+# 与前端「探索工程」的 12 个工程领域保持一致。
+SPECIALTIES = (
+    '机械工程', '电气与电子工程', '计算机工程', '土木工程', '化学工程', '材料科学与工程',
+    '生物医学工程', '航空航天工程', '环境工程', '机器人与机电一体化', '工业与系统工程', '能源工程',
+)
+
 def connect():
     db = sqlite3.connect(DB, timeout=15)
     db.row_factory = sqlite3.Row
@@ -32,7 +38,10 @@ def initialize():
           salt TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('student','engineer')),
           specialty TEXT NOT NULL DEFAULT '机械工程', bio TEXT NOT NULL DEFAULT '',
           years INTEGER NOT NULL DEFAULT 0, fee TEXT NOT NULL DEFAULT '公益指导',
-          available INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL);
+          available INTEGER NOT NULL DEFAULT 1, created INTEGER NOT NULL,
+          topics TEXT NOT NULL DEFAULT '', problems TEXT NOT NULL DEFAULT '',
+          audience TEXT NOT NULL DEFAULT '', modes TEXT NOT NULL DEFAULT '',
+          capacity TEXT NOT NULL DEFAULT '', verified INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS sessions (
           token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS requests (
@@ -52,12 +61,18 @@ def initialize():
         CREATE TABLE IF NOT EXISTS visitors (token TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS page_stats (key TEXT PRIMARY KEY, value INTEGER NOT NULL DEFAULT 0);
         ''')
+        # 旧数据库补全新版工程师卡片字段（列已存在时会报错，忽略即可）。
+        for column in ('topics','problems','audience','modes','capacity'):
+            try: db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError: pass
+        try: db.execute('ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0')
+        except sqlite3.OperationalError: pass
     keyfile=DATA/'admin-setup-key.txt'
     if not keyfile.exists():
         keyfile.write_text(secrets.token_urlsafe(32),encoding='utf-8')
 
 def public_user(row):
-    return {**{k:row[k] for k in ('id','name','role','specialty','bio','years','fee','available')},'is_admin':bool(row['is_admin']) if 'is_admin' in row.keys() else False}
+    return {**{k:row[k] for k in ('id','name','role','specialty','bio','years','fee','available','topics','problems','audience','modes','capacity')},'verified':bool(row['verified']),'is_admin':bool(row['is_admin']) if 'is_admin' in row.keys() else False}
 
 def account(db,uid):
     return db.execute('SELECT u.*,EXISTS(SELECT 1 FROM administrators a WHERE a.user_id=u.id) is_admin FROM users u WHERE u.id=?',(uid,)).fetchone()
@@ -115,6 +130,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.startswith('/api/'):
             return self.api('GET',path)
+        if path == '/download/spankindle.zip':
+            return self.send_app_package()
         files = {'/':'index.html','/app.js':'app.js','/style.css':'style.css','/favicon.svg':'favicon.svg'}
         if path not in files: return self.respond({'error':'页面不存在。'},404)
         filename = ROOT / files[path]
@@ -131,6 +148,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Security-Policy',"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://trae-api-cn.mchost.guru https://lf-cdn.trae.com.cn; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
         if visitor_cookie:
             self.send_header('Set-Cookie',visitor_cookie)
+        self.send_header('Content-Length',str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_app_package(self):
+        """下发安卓 App 安装包。把安装包放到 download/spankindle.zip 即可。"""
+        package = ROOT / 'download' / 'spankindle.zip'
+        if not package.exists():
+            return self.respond({'error':'安装包尚未上传。'},404)
+        body = package.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Type','application/zip')
+        self.send_header('Content-Disposition','attachment; filename="spankindle.zip"')
+        self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('Content-Length',str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -189,6 +220,11 @@ class Handler(BaseHTTPRequestHandler):
                     if path == '/api/engineers':
                         rows = db.execute("SELECT * FROM users WHERE role='engineer' AND available=1 ORDER BY created DESC").fetchall()
                         return self.respond({'engineers':[public_user(r) for r in rows]})
+                    if path == '/api/engineer':
+                        eid=int(parse_qs(urlparse(self.path).query).get('id',['0'])[0])
+                        row = db.execute("SELECT * FROM users WHERE id=? AND role='engineer' AND available=1",(eid,)).fetchone()
+                        if not row: raise APIError('这位工程师暂未开放预约。',404)
+                        return self.respond({'engineer':public_user(row)})
                     u = self.user(db)
                     if path.startswith('/api/admin/'):
                         if not u['is_admin']: raise APIError('只有管理员可以访问管理后台。',403)
@@ -295,13 +331,21 @@ class Handler(BaseHTTPRequestHandler):
                     name=self.field(data,'name',40)
                     bio=self.field(data,'bio',1500,0)
                     specialty=self.field(data,'specialty',40)
-                    if specialty not in ('机械工程','电子工程','土木工程','环境工程','计算机工程','航空航天'): raise APIError('请选择有效专业。')
+                    if specialty not in SPECIALTIES: raise APIError('请选择有效专业。')
                     years=int(data.get('years',0))
                     if not 0<=years<=70: raise APIError('从业年限需在 0–70 年之间。')
-                    # 平台所有指导均为公益性质，忽略客户端可能提交的 fee 字段。
+                    # 工程师卡片的补充信息，帮助学生判断这位前辈能否解决自己的问题。
+                    topics=self.field(data,'topics',120,0)
+                    problems=self.field(data,'problems',200,0)
+                    audience=self.field(data,'audience',60,0)
+                    modes=self.field(data,'modes',80,0)
+                    capacity=self.field(data,'capacity',60,0)
+                    # 平台所有指导均为公益性质，忽略客户端可能提交的 fee 字段；核实状态也仅由管理员维护。
                     fee='公益指导'
                     available=1 if data.get('available') is True else 0
-                    db.execute('UPDATE users SET name=?,bio=?,specialty=?,years=?,fee=?,available=? WHERE id=?',(name,bio,specialty,years,fee,available,u['id']))
+                    db.execute('''UPDATE users SET name=?,bio=?,specialty=?,years=?,fee=?,available=?,
+                    topics=?,problems=?,audience=?,modes=?,capacity=? WHERE id=?''',
+                    (name,bio,specialty,years,fee,available,topics,problems,audience,modes,capacity,u['id']))
                     db.commit()
                     return self.respond({'ok':True})
                 if path == '/api/requests':
